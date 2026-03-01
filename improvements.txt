@@ -1,0 +1,23 @@
+If you'd like next:
+
+Show "X is typing…"
+
+Show active user count
+
+Add "Host" badge
+
+Add reconnect recovery
+
+Add room capacity limits
+
+If you want next-level UX polish, next we can:
+
+Add "Next Stranger" button
+
+Auto-rematch on disconnect
+
+Add typing indicator
+
+Add "Stranger disconnected" message
+
+You're very close to production-grade now 🔥

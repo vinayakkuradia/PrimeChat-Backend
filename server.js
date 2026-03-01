@@ -1,11 +1,7 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 import { randomUUID } from "crypto";
-import fs from "fs";
-import path from "path";
 import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
 
 const PORT = process.env.PORT || 8080;
 
@@ -13,13 +9,15 @@ const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_URL
   ? new URL(process.env.RENDER_EXTERNAL_URL).hostname
   : null;
 
+/* -----------------------------
+   UTILITIES
+--------------------------------*/
+
 function getWsUrl(req) {
-  // Render provides this in production
   if (process.env.RENDER_EXTERNAL_URL) {
     return process.env.RENDER_EXTERNAL_URL.replace(/^http/, "ws");
   }
 
-  // Local dev fallback
   const host = req.headers.host;
   return `ws://${host}`;
 }
@@ -30,14 +28,14 @@ function isAllowedOrigin(origin) {
   try {
     const { hostname } = new URL(origin);
 
-    // Your custom domain(s)
     if (hostname.endsWith("incognitifier.com")) return true;
-
-    // Your specific Render service only
     if (RENDER_HOSTNAME && hostname === RENDER_HOSTNAME) return true;
-
-    // Local dev
-    if (hostname === "localhost" || hostname === "127.0.0.1") return true;
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "192.168.1.2"
+    )
+      return true;
 
     return false;
   } catch {
@@ -45,12 +43,17 @@ function isAllowedOrigin(origin) {
   }
 }
 
+/* -----------------------------
+   SERVER SETUP
+--------------------------------*/
 
-// HTTP server (required by Render)
 const server = http.createServer((req, res) => {
   if (req.url === "/_ws") {
     const wsUrl = getWsUrl(req);
-    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    });
     res.end(JSON.stringify({ wsUrl }));
     return;
   }
@@ -59,15 +62,54 @@ const server = http.createServer((req, res) => {
   res.end();
 });
 
-// Attach WebSocket to HTTP server
 const wss = new WebSocketServer({ server });
-
-const rooms = new Map();
-const MAX_MESSAGES_PER_ROOM = 100;
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+/* -----------------------------
+   DATA STORES
+--------------------------------*/
+
+const rooms = new Map();
+/*
+roomName -> {
+  clients: Set<ws>,
+  messages: [],
+  isPrivate: boolean,
+  passcode: string | null,
+  hostId: string,
+  lastActive: number
+}
+*/
+
+const waitingUsers = new Set(); // stranger pool
+
+const MAX_MESSAGES_PER_ROOM = 100;
+
+/* -----------------------------
+   CLEANUP (private room timeout)
+--------------------------------*/
+
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [roomName, info] of rooms.entries()) {
+    if (
+      info.isPrivate &&
+      info.clients.size === 0 &&
+      now - info.lastActive > 5 * 60 * 1000
+    ) {
+      rooms.delete(roomName);
+      console.log(`Private room ${roomName} deleted (inactive)`);
+    }
+  }
+}, 60 * 1000);
+
+/* -----------------------------
+   WEBSOCKET LOGIC
+--------------------------------*/
 
 wss.on("connection", (ws, req) => {
   const origin = req.headers.origin;
@@ -82,6 +124,17 @@ wss.on("connection", (ws, req) => {
   ws.room = null;
   ws.userId = randomUUID();
 
+  ws.send(
+    JSON.stringify({
+      type: "your-id",
+      userId: ws.userId,
+    }),
+  );
+
+  /* -----------------------------
+     MESSAGE HANDLER
+  --------------------------------*/
+
   ws.on("message", (raw) => {
     let data;
     try {
@@ -90,53 +143,196 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (data.type === "list-rooms") {
-      const publicRooms = [];
-      for (const [roomName, info] of rooms.entries()) {
-        if (!info.isPrivate) publicRooms.push(roomName);
+    /* =============================
+       STRANGER MATCHMAKING
+    ==============================*/
+
+    if (data.type === "stranger-join") {
+      if (ws.room) return;
+
+      // Always set username immediately
+      ws.username = data.username;
+
+      const partner = waitingUsers.values().next().value;
+
+      if (partner && partner !== ws) {
+        waitingUsers.delete(partner);
+
+        const roomName = `stranger-${randomUUID()}`;
+
+        rooms.set(roomName, {
+          clients: new Set(),
+          messages: [],
+          isPrivate: true,
+          passcode: null,
+          hostId: ws.userId,
+          lastActive: Date.now(),
+        });
+
+        ws.room = roomName;
+        partner.room = roomName;
+
+        const roomInfo = rooms.get(roomName);
+        roomInfo.clients.add(ws);
+        roomInfo.clients.add(partner);
+
+        // Send IDs to BOTH
+        // ws.send(
+        //   JSON.stringify({
+        //     type: "your-id",
+        //     userId: ws.userId,
+        //   }),
+        // );
+
+        // partner.send(
+        //   JSON.stringify({
+        //     type: "your-id",
+        //     userId: partner.userId,
+        //   }),
+        // );
+
+        ws.send(JSON.stringify({ type: "stranger-matched" }));
+        partner.send(JSON.stringify({ type: "stranger-matched" }));
+
+        // Notify both users
+        broadcastToRoom(roomName, {
+          type: "system",
+          message: `${ws.username} joined`,
+        });
+
+        broadcastToRoom(roomName, {
+          type: "system",
+          message: `${partner.username} joined`,
+        });
+
+        return;
       }
-      ws.send(
-        JSON.stringify({ type: "room-list", rooms: publicRooms.slice(0, 25) }),
-      );
+
+      // No partner → enter waiting pool
+      waitingUsers.add(ws);
+
+      ws.send(JSON.stringify({ type: "stranger-waiting" }));
       return;
     }
 
+    /* =============================
+       CREATE ROOM
+    ==============================*/
+
     if (data.type === "create-room") {
-      const { roomName, isPrivate } = data;
+      const { roomName, isPrivate, passcode } = data;
       if (!roomName) return;
+
+      if (rooms.has(roomName)) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Room already exists",
+          }),
+        );
+        return;
+      }
+
       if (!rooms.has(roomName)) {
         rooms.set(roomName, {
           clients: new Set(),
           messages: [],
           isPrivate: !!isPrivate,
+          passcode: isPrivate ? passcode : null,
+          hostId: ws.userId,
+          lastActive: Date.now(),
         });
       }
+
       return;
     }
 
+    /* =============================
+       LIST ROOMS (public only)
+    ==============================*/
+
+    if (data.type === "list-rooms") {
+      const publicRooms = [];
+
+      for (const [roomName, info] of rooms.entries()) {
+        if (!info.isPrivate) publicRooms.push(roomName);
+      }
+
+      ws.send(
+        JSON.stringify({
+          type: "room-list",
+          rooms: publicRooms.slice(0, 25),
+        }),
+      );
+
+      return;
+    }
+
+    /* =============================
+       JOIN ROOM
+    ==============================*/
+
     if (data.type === "join") {
-      const { username, room } = data;
+      const { username, room, passcode } = data;
       if (!username || !room) return;
+
+      if (!rooms.has(room)) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Room does not exist",
+          }),
+        );
+        return;
+      }
+
+      const roomInfo = rooms.get(room);
+
+      if (roomInfo.isPrivate) {
+        if (roomInfo.passcode !== passcode) {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Invalid passcode",
+            }),
+          );
+          return;
+        }
+      }
 
       ws.username = username;
       ws.room = room;
 
-      if (!rooms.has(room)) {
-        rooms.set(room, { clients: new Set(), messages: [], isPrivate: false });
-      }
-
-      const roomInfo = rooms.get(room);
       roomInfo.clients.add(ws);
+      roomInfo.lastActive = Date.now();
 
       ws.send(JSON.stringify({ type: "your-id", userId: ws.userId }));
+
       roomInfo.messages.forEach((msg) => ws.send(JSON.stringify(msg)));
+
+      // Notify new user about existing users
+      for (const client of roomInfo.clients) {
+        if (client !== ws && client.username) {
+          ws.send(
+            JSON.stringify({
+              type: "system",
+              message: `${client.username} joined`,
+            }),
+          );
+        }
+      }
 
       broadcastToRoom(room, {
         type: "system",
         message: `${username} joined ${room}`,
       });
+
       return;
     }
+
+    /* =============================
+       CHAT MESSAGE
+    ==============================*/
 
     if (data.type === "message") {
       if (!ws.username || !ws.room) return;
@@ -152,183 +348,57 @@ wss.on("connection", (ws, req) => {
       };
 
       roomInfo.messages.push(payload);
+
       if (roomInfo.messages.length > MAX_MESSAGES_PER_ROOM) {
         roomInfo.messages.shift();
       }
 
+      roomInfo.lastActive = Date.now();
+
       broadcastToRoom(ws.room, payload);
+      return;
     }
   });
 
+  /* -----------------------------
+     DISCONNECT
+  --------------------------------*/
+
   ws.on("close", () => {
+    waitingUsers.delete(ws);
+
     if (!ws.username || !ws.room) return;
 
     const roomInfo = rooms.get(ws.room);
     if (!roomInfo) return;
 
     roomInfo.clients.delete(ws);
+    roomInfo.lastActive = Date.now();
 
     broadcastToRoom(ws.room, {
       type: "system",
       message: `${ws.username} left the chat`,
     });
 
-    if (roomInfo.clients.size === 0) {
+    if (roomInfo.clients.size === 0 && !roomInfo.isPrivate) {
       rooms.delete(ws.room);
     }
   });
 });
+
+/* -----------------------------
+   BROADCAST HELPER
+--------------------------------*/
 
 function broadcastToRoom(roomName, payload) {
   const roomInfo = rooms.get(roomName);
   if (!roomInfo) return;
 
   const msg = JSON.stringify(payload);
+
   for (const client of roomInfo.clients) {
     if (client.readyState === client.OPEN) {
       client.send(msg);
     }
   }
 }
-
-// // server.js
-// import { WebSocketServer } from "ws";
-// import { randomUUID } from "crypto";
-
-// const wss = new WebSocketServer({ port: 8080 });
-// const rooms = new Map(); // roomName -> { clients: Set<ws>, messages: Array, isPrivate: boolean }
-
-// const MAX_MESSAGES_PER_ROOM = 100; // keep last 100 messages per room
-
-// console.log("WebSocket server running on ws://localhost:8080");
-
-// wss.on("connection", (ws) => {
-//   ws.username = null;
-//   ws.room = null;
-//   ws.userId = randomUUID(); // unique per connection
-
-//   console.log("Client connected:", ws.userId);
-
-//   ws.on("message", (raw) => {
-//     let data;
-//     try {
-//       data = JSON.parse(raw.toString());
-//     } catch {
-//       return;
-//     }
-
-//     // LIST PUBLIC ROOMS
-//     if (data.type === "list-rooms") {
-//       const publicRooms = [];
-//       for (const [roomName, info] of rooms.entries()) {
-//         if (!info.isPrivate) publicRooms.push(roomName);
-//       }
-//       ws.send(JSON.stringify({ type: "room-list", rooms: publicRooms.slice(0, 25) }));
-//       return;
-//     }
-
-//     // CREATE ROOM
-//     if (data.type === "create-room") {
-//       const { roomName, isPrivate } = data;
-//       if (!roomName) return;
-//       if (!rooms.has(roomName)) {
-//         rooms.set(roomName, { clients: new Set(), messages: [], isPrivate: !!isPrivate });
-//         console.log(`Room created: ${roomName} (private=${!!isPrivate})`);
-//       }
-//       return;
-//     }
-
-//     // JOIN ROOM
-//     if (data.type === "join") {
-//       const { username, room } = data;
-//       if (!username || !room) return;
-
-//       ws.username = username;
-//       ws.room = room;
-
-//       if (!rooms.has(room)) {
-//         rooms.set(room, { clients: new Set(), messages: [], isPrivate: false });
-//       }
-
-//       const roomInfo = rooms.get(room);
-//       roomInfo.clients.add(ws);
-
-//       // Send own userId for front-end differentiation
-//       ws.send(JSON.stringify({ type: "your-id", userId: ws.userId }));
-
-//       // Send last messages to the new client
-//       roomInfo.messages.forEach((msg) => ws.send(JSON.stringify(msg)));
-
-//       // Broadcast system message
-//       broadcastToRoom(room, {
-//         type: "system",
-//         message: `${username} joined ${room}`,
-//       });
-
-//       console.log(`${username} joined room ${room}`);
-//       return;
-//     }
-
-//     // CHAT MESSAGE
-//     if (data.type === "message") {
-//       if (!ws.username || !ws.room) return;
-
-//       const roomInfo = rooms.get(ws.room);
-//       if (!roomInfo) return;
-
-//       const payload = {
-//         type: "message",
-//         username: ws.username,
-//         userId: ws.userId,
-//         message: data.message,
-//       };
-
-//       // Add to room messages
-//       roomInfo.messages.push(payload);
-
-//       // Drop oldest messages if exceeding limit
-//       if (roomInfo.messages.length > MAX_MESSAGES_PER_ROOM) {
-//         roomInfo.messages.shift();
-//       }
-
-//       broadcastToRoom(ws.room, payload);
-//       return;
-//     }
-//   });
-
-//   ws.on("close", () => {
-//     if (!ws.username || !ws.room) return;
-
-//     const roomInfo = rooms.get(ws.room);
-//     if (!roomInfo) return;
-
-//     roomInfo.clients.delete(ws);
-
-//     broadcastToRoom(ws.room, {
-//       type: "system",
-//       message: `${ws.username} left the chat`,
-//     });
-
-//     // Clean up empty rooms
-//     if (roomInfo.clients.size === 0) {
-//       rooms.delete(ws.room);
-//       console.log(`Room ${ws.room} deleted`);
-//     }
-
-//     console.log(`${ws.username} disconnected`);
-//   });
-// });
-
-// // Helper: broadcast to all clients in a room
-// function broadcastToRoom(roomName, payload) {
-//   const roomInfo = rooms.get(roomName);
-//   if (!roomInfo) return;
-
-//   const msg = JSON.stringify(payload);
-
-//   for (const client of roomInfo.clients) {
-//     if (client.readyState === client.OPEN) {
-//       client.send(msg);
-//     }
-//   }
-// }
