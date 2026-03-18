@@ -6,7 +6,8 @@ const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
   if (req.url === "/_ws") {
-    const wsUrl = `ws://${req.headers.host}`;
+    const protocol = req.socket.encrypted ? "wss" : "ws";
+    const wsUrl = `${protocol}://${req.headers.host}`;
 
     res.writeHead(200, {
       "Content-Type": "application/json",
