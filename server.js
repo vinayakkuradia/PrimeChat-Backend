@@ -6,9 +6,12 @@ const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
   if (req.url === "/_ws") {
-    const protocol = location.protocol === "https:" ? "wss" : "ws"
-    const wsUrl = `${protocol}://${req.headers.host}`;
+    const forwardedProto = req.headers["x-forwarded-proto"];
 
+    const protocol = forwardedProto ? forwardedProto.split(",")[0] // handle "https,http"
+      : (req.socket.encrypted ? "https" : "http");
+    const wsUrl = `${protocol}://${req.headers.host}`;
+    
     res.writeHead(200, {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
