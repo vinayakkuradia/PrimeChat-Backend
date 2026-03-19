@@ -36,6 +36,22 @@ server.listen(PORT, () => {
 --------------------------------*/
 
 const waitingUsers = new Set();
+const activeUsers = new Set();
+
+/* BROADCAST ACTIVE USERS */
+function broadcastActiveUsersCount() {
+  const count = activeUsers.size;
+  const message = JSON.stringify({
+    type: "active-users",
+    count: count,
+  });
+
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  });
+}
 
 /* -----------------------------
    WEBSOCKET
@@ -45,6 +61,10 @@ wss.on("connection", (ws) => {
   ws.userId = randomUUID();
   ws.partner = null;
   ws.username = null;
+
+  activeUsers.add(ws.userId);
+  console.log(`User connected: ${ws.userId} (Total active users: ${activeUsers.size})`);
+  broadcastActiveUsersCount();
 
   ws.send(
     JSON.stringify({
@@ -70,6 +90,7 @@ wss.on("connection", (ws) => {
       if (ws.partner) return;
 
       ws.username = data.username;
+      broadcastActiveUsersCount();
 
       const partner = waitingUsers.values().next().value;
 
@@ -175,8 +196,10 @@ wss.on("connection", (ws) => {
   --------------------------------*/
 
   ws.on("close", () => {
+    activeUsers.delete(ws.userId);
     waitingUsers.delete(ws);
     disconnectPartner(ws);
+    broadcastActiveUsersCount();
   });
 });
 
